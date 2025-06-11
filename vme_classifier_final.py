@@ -7,6 +7,7 @@ Dependencies:
 """
 
 import os
+import cv2
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -91,10 +92,6 @@ for fold, (train_idx, val_idx) in enumerate(
     val_loader   = DataLoader(val_ds,   batch_size=16,
                               shuffle=False, num_workers=4)
 
-    # 폴드별 데이터 분포 확인
-    print(f"--- Fold {fold} ---")
-    print("Train labels:", train_df.label.value_counts().to_dict())
-    print("Val   labels:",   val_df.label.value_counts().to_dict())
 
 # 5) Prompt maker
 def make_prompt(cat):
@@ -106,7 +103,7 @@ class CLIPFusionClassifier(nn.Module):
         super().__init__()
         self.clip = clip_model
         # RN50’s visual encoder produces a 1024-dim embedding:
-        embed_dim = clip_model.visual.output_dim  
+        embed_dim = clip_model.visual.output_dim
 
         # now use that dynamically instead of “512”
         self.img_proj = nn.Linear(embed_dim, embed_dim)
@@ -138,29 +135,7 @@ optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr
 criterion = nn.BCEWithLogitsLoss()
 
 # 8) Cross-validation training
-"""skf = StratifiedKFold(n_splits=8, shuffle=True, random_state=42)
-
-    for f, (train_idx, val_idx) in enumerate(
-        skf.split(df, df['label']), start=1):
-
-    train_df = df.iloc[train_idx].reset_index(drop=True)
-    val_df   = df.iloc[val_idx].reset_index(drop=True)
-
-    train_ds = VMEDataset(train_df, train_tf)
-    val_ds   = VMEDataset(val_df,   val_tf)
-
-    train_loader = DataLoader(train_ds, batch_size=16,
-                              shuffle=True,  num_workers=4)
-    val_loader   = DataLoader(val_ds,   batch_size=16,
-                              shuffle=False, num_workers=4)
-
-    # 폴드별 데이터 분포 확인
-    print(f"--- Fold {f} ---")
-    print("Train labels:", train_df.label.value_counts().to_dict())
-    print("Val   labels:",   val_df.label.value_counts().to_dict())"""
-
 skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-
 fold_metrics = []
 for fold, (train_idx, val_idx) in enumerate(skf.split(df, df['label']), start=1):
     print(f"=== Fold {fold}/{n_splits} ===")
@@ -185,8 +160,8 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(df, df['label']), start=1)
             loss = criterion(logits, labels)
             running_loss += loss.item() * imgs.size(0)
 
-            optimizer.zero_grad() 
-            loss.backward() 
+            optimizer.zero_grad()
+            loss.backward()
             optimizer.step()
         epoch_loss = running_loss / len(train_ds)
         print(f" Epoch {epoch+1}/{num_epochs} – Train Loss: {epoch_loss:.4f}")
@@ -214,61 +189,99 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(df, df['label']), start=1)
     print(f"Fold {fold+1} AUC: {auc:.3f}, F1: {f1:.3f}, Accuracy: {acc:.3f}")
     fold_metrics.append((auc, f1))
 
+# --- assume `model` is your trained CLIPFusionClassifier, on device ---
+model.eval()
 
-"""
-# 9) Grad-CAM visualization for a sample
-# Pick first val sample
-sample_img, _, sample_cat = val_ds[0]
-orig = Image.open(val_df.iloc[0].path).convert('RGB').resize((224,224))
-orig_np = np.array(orig)/255.0
-img_tensor = sample_img.unsqueeze(0).to(device)
-text_token = clip.tokenize([make_prompt(sample_cat)]).to(device)
+# 1) Prepare target layer and make sure it can collect grads
+target_layer = model.clip.visual.layer4[-1]   # last Bottleneck
+# unfreeze that layer so grads can flow
+for p in target_layer.parameters():
+    p.requires_grad = True
 
-# Hook for last conv of RN50
-# Setup hooks
+# 2) Hook definitions
 gradients = []
 activations = []
 
-def forward_hook(module, input, output):
-    activations.append(output)
+def forward_hook(module, inp, out):
+    activations.append(out)
 
-def backward_hook(module, grad_input, grad_output):
-    gradients.append(grad_output[0])
+def backward_hook(module, grad_in, grad_out):
+    gradients.append(grad_out[0])
 
-# Hook to the last residual block
-target_layer = model.clip.visual.layer4[-1]
+# 3) Register hooks
 target_layer.register_forward_hook(forward_hook)
-target_layer.register_full_backward_hook(backward_hook)
+target_layer.register_backward_hook(backward_hook)
 
-# Get one sample from val_ds
-sample_img, _, sample_cat = val_ds[0]
-img_tensor = sample_img.unsqueeze(0).to(device)
-text_token = clip.tokenize([make_prompt(sample_cat)]).to(device)
+# 4) Preprocessing
+preproc = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize((0.4815,0.4578,0.4082),
+                         (0.2686,0.2613,0.2758))
+])
 
-# Forward + backward pass
-model.zero_grad()
-_, logits = model(img_tensor, text_token)
-logit = logits[0]
-logit.backward()
+os.makedirs("gradcam_outputs", exist_ok=True)
 
-# Now hooks should have fired
-if not gradients or not activations:
-    raise RuntimeError("Grad-CAM hooks did not capture any gradients/activations.")
+# 5) Loop over your DataFrame of images `df`
+for idx, row in df.iterrows():
+    # clear hooks data
+    gradients.clear()
+    activations.clear()
 
-grad = gradients[0][0].cpu().numpy()
-act  = activations[0][0].cpu().numpy()
-weights = np.mean(grad, axis=(1, 2))
-cam = np.sum(weights[:, None, None] * act, axis=0)
-cam = np.maximum(cam, 0)
-cam /= cam.max()
+    # load & preprocess
+    img = Image.open(row.path).convert("RGB")
+    inp = preproc(img).unsqueeze(0).to(device)
+    inp.requires_grad_()
 
+    # tokenize prompt
+    txt = clip.tokenize([make_prompt(row.category)]).to(device)
 
-# Plot Grad-CAM
-plt.figure(figsize=(5,5))
-plt.imshow(orig_np)
-plt.imshow(cam, cmap='jet', alpha=0.5)
-plt.title(f"Grad-CAM: {sample_cat}")
-plt.axis('off')"""
+    # forward
+    model.zero_grad()
+    _, logits = model(inp, txt)
+    score = logits.squeeze()  # raw logit
+
+    # backward on the class score
+    score.backward()
+
+    # check
+    if not gradients or not activations:
+        raise RuntimeError("No grads/acts—check that layer wasn’t frozen.")
+
+    # build CAM
+    grad = gradients[0][0].detach().cpu().numpy()
+    act  = activations[0][0].detach().cpu().numpy()
+    weights = grad.mean(axis=(1,2))
+    cam = np.maximum((weights[:,None,None]*act).sum(axis=0), 0)
+    cam /= cam.max()
+
+    # 1) Load the high-res original
+    orig = Image.open(row.path).convert("RGB")
+    orig_w, orig_h = orig.size
+    orig_np = np.array(orig)  # (H, W, 3), uint8
+
+    # 2) Upsample your cam to that same size
+    cam_resized = cv2.resize(
+        (cam * 255).astype(np.uint8),
+        (orig_w, orig_h),
+        interpolation=cv2.INTER_LINEAR
+    )
+
+    # 3) Turn it into a color heatmap
+    heatmap = cv2.applyColorMap(cam_resized, cv2.COLORMAP_JET)  # still BGR
+
+    # 4) Blend (0.6 original, 0.4 heatmap—for example)
+    blended = cv2.addWeighted(
+        orig_np[..., ::-1], 0.6,   # RGB→BGR
+        heatmap,         0.4,
+        gamma=0
+    )
+
+    # 5) Save back as RGB
+    out = Image.fromarray(blended[..., ::-1])
+    out.save(f"gradcam_outputs/{row.category}_{idx}_overlay_big.png")
+
 
 # 10) Embedding extraction and PCA/t-SNE
 all_emb, all_lbl = [], []
