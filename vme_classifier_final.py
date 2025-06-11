@@ -1,4 +1,4 @@
-# Complete pipeline: DataLoader, 8-fold CV, CLIP fusion model, training, Grad-CAM & embedding visualization
+# Complete pipeline: DataLoader, 8-fold CV, CLIP fusion model, training, Grad-CAM & embedding visualization!
 
 """
 Dependencies:
